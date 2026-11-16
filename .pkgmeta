@@ -2,3 +2,5 @@ package-as: Sintezza_Perf
 manual-changelog:
   filename: CHANGELOG.md
   markup-type: markdown
+optional-dependencies:
+  - 1810657-sintezza-theme
