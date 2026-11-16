@@ -20,9 +20,9 @@ Open `/sperf` to compare recent addon CPU time and Lua memory. Sort by any colum
 
 Start a 30-second capture with `/sperf watch 30`. Captures stop automatically and continue if you close the window. Open **Spikes** and select an interval to inspect the contributing addons. Background spike monitoring is available as an opt-in setting.
 
-### Requirements
+### Appearance
 
-This addon works on its own. Optional [Sintezza Theme](https://github.com/ArtefactoO/Sintezza_Theme) provides shared colors, fonts, and a movable minimap button. With Theme installed, open `/stheme` to change the palette and fonts of the Perf window.
+**[Sintezza Theme](https://github.com/ArtefactoO/Sintezza_Theme) is optional.** Install it and open `/stheme` to choose the Perf window's palette and fonts. Theme also adds a movable minimap button.
 
 <!-- Changelog field -->
 
