@@ -1,0 +1,13 @@
+## Interface: 16001
+## Title: Sintezza Perf
+## Notes: Addon performance snapshots, timed captures, and background spike monitoring.
+## Notes-ruRU: Нагрузка аддонов, ручные замеры и фоновый сбор спайков.
+## Author: Sintezza
+## X-License: MIT
+## Version: 0.6.3
+## IconTexture: Interface\AddOns\Sintezza_Perf\Media\Icon
+## OptionalDeps: Sintezza_Theme
+## SavedVariables: Sintezza_PerfDB
+
+Perf.lua
+Window.lua
