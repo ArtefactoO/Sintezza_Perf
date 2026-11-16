@@ -24,4 +24,8 @@ Start a 30-second capture with `/sperf watch 30`. Captures stop automatically an
 
 This addon works on its own. Optional [Sintezza Theme](https://github.com/ArtefactoO/Sintezza_Theme) provides shared colors, fonts, and a movable minimap button.
 
+### Changelog
+
+[View the release history on GitHub](https://github.com/ArtefactoO/Sintezza_Perf/blob/main/CHANGELOG.md).
+
 Source, installation details, and credits are available on [GitHub](https://github.com/ArtefactoO/Sintezza_Perf).
