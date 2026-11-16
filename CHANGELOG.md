@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.4
+
+- Updated the project logo and in-game addon icon.
+
+### По-русски
+
+- Обновлены логотип проекта и игровая иконка аддона.
+
 ## 0.6.3
 
 - Chat reports use localized milliseconds and seconds. Command help shows the addon folder placeholder in the current language.
