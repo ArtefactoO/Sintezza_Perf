@@ -7,6 +7,7 @@
 | Flavor and version | Forever 1.60.1 |
 | Main category | Development Tools |
 | Additional categories | Miscellaneous |
+| CurseForge relations | Sintezza Theme (Optional Dependency) |
 | Project license | MIT. See the repository for third-party notices. |
 
 ## Summary
