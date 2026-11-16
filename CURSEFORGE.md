@@ -22,7 +22,7 @@ Start a 30-second capture with `/sperf watch 30`. Captures stop automatically an
 
 ### Requirements
 
-This addon works on its own. Optional [Sintezza Theme](https://github.com/ArtefactoO/Sintezza_Theme) provides shared colors, fonts, and a movable minimap button.
+This addon works on its own. Optional [Sintezza Theme](https://github.com/ArtefactoO/Sintezza_Theme) provides shared colors, fonts, and a movable minimap button. With Theme installed, open `/stheme` to change the palette and fonts of the Perf window.
 
 <!-- Changelog field -->
 
