@@ -4,3 +4,6 @@ manual-changelog:
   markup-type: markdown
 optional-dependencies:
   - 1810657-sintezza-theme
+ignore:
+  - Docs/CurseForge
+  - Tests

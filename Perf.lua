@@ -1,539 +1,426 @@
 local addonName, ns = ...
-local theme = Sintezza_Theme
-local function Text(russian, english)
-    local locale = theme and theme:GetLocale() or GetLocale()
-    return locale == "ruRU" and russian or english
-end
-ns.Text = Text
-
-local api = C_AddOnProfiler
-local metric = Enum and Enum.AddOnProfilerMetric
-local addons = C_AddOns
+local L, Number = ns.Text, ns.Number
+local api, metrics, addons = C_AddOnProfiler, Enum and Enum.AddOnProfilerMetric, C_AddOns
+local active, last, background, memory, settings, armed
+local collector, events = CreateFrame("Frame"), CreateFrame("Frame")
+local clock, profileClock = GetTimePreciseSec or GetTime, debugprofilestop
 local thresholds = { "CountTimeOver5Ms", "CountTimeOver10Ms", "CountTimeOver50Ms" }
-local topModes = {
-    recent = { "RecentAverageTime", Text("Недавнее среднее, мс", "Recent average, ms"), "%.3f" },
-    peak = { "PeakTime", Text("Пик с начала сеанса, мс", "Session peak, ms"), "%.3f" },
-    spikes = { "CountTimeOver5Ms", Text("Кадры >5 мс за сеанс", "Session frames >5 ms"), "%d" },
-    memory = { false, Text("Память, МиБ", "Memory, MiB"), "%.2f" },
-}
-local active, last, loader
-local background, settings
-local backgroundInterval, backgroundWindows = 5, 6
-local memoryScannedAt, memoryUpdated
-
-local function MarkMemoryScan()
-    local now = GetTime()
-    if memoryScannedAt == now then return end
-    memoryScannedAt, memoryUpdated = now, date("%H:%M:%S")
-end
-
-if type(hooksecurefunc) == "function" and type(UpdateAddOnMemoryUsage) == "function" then
-    hooksecurefunc("UpdateAddOnMemoryUsage", MarkMemoryScan)
-end
-
-local function Print(message)
-    print("|cffabd3edSintezza Perf|r " .. message)
-end
-
-local function ReadNumber(fn, ...)
-    if not fn then return end
+local memoryGeneration, scannedAt, scannedUnix, memoryRequested = 0, nil, nil, false
+ns.COST_BUDGET_MS, ns.COST_WINDOW = 1, 60
+local function Read(fn, ...)
+    if type(fn) ~= "function" then return end
     local ok, value = pcall(fn, ...)
-    if ok and (not issecretvalue or not issecretvalue(value)) and type(value) == "number"
-        and value >= 0 and value < math.huge then return value end
+    if ok then return Number(value) end
 end
-
-local function Read(name, key)
-    local id = metric and metric[key]
+local function Metric(name, key)
+    local id = metrics and metrics[key]
     if id == nil or not api then return end
-    if name then return ReadNumber(api.GetAddOnMetric, name, id) end
-    return ReadNumber(api.GetOverallMetric, id)
+    if name then return Read(api.GetAddOnMetric, name, id) end
+    return Read(api.GetOverallMetric, id)
 end
-
-local function RecentTimes()
-    local id = metric and metric.RecentAverageTime
-    return Read(nil, "RecentAverageTime"), id and api and ReadNumber(api.GetApplicationMetric, id)
+ns.Metric = Metric
+function ns.Available()
+    if not (api and api.GetAddOnMetric and api.GetOverallMetric and metrics and metrics.LastTime ~= nil
+        and addons and addons.GetNumAddOns and addons.GetAddOnInfo and addons.IsAddOnLoaded) then return false end
+    if api.IsEnabled then
+        local ok, enabled = pcall(api.IsEnabled)
+        if not ok or issecretvalue and issecretvalue(enabled) or enabled ~= true then return false end
+    end
+    return true
 end
-
-local function FrameShare(time, frame)
-    if time and frame and frame > 0 and time <= frame then return time / frame * 100 end
-end
-
-local function EstimateFPSCost(time, fps)
-    if not (time and fps and fps > 0) then return end
-    local frame = 1000 / fps
-    if time < frame then return math.max(0, 1000 / (frame - time) - fps) end
-end
-
-local function AddOnsAvailable()
-    return addons and addons.GetNumAddOns and addons.GetAddOnInfo and type(addons.IsAddOnLoaded) == "function"
-end
-
-local function Available()
-    return api and api.GetAddOnMetric and metric and metric.CountTimeOver5Ms ~= nil
-        and (not api.IsEnabled or api.IsEnabled())
-        and AddOnsAvailable()
-end
-ns.Available = Available
-
-local function LoadedAddons()
+local function Loaded()
     local names = {}
+    if not addons or not addons.GetNumAddOns then return names end
     for index = 1, addons.GetNumAddOns() do
         local name, _, _, _, _, security = addons.GetAddOnInfo(index)
-        local loading, loaded = addons.IsAddOnLoaded(index)
-        if type(name) == "string" and (not issecretvalue or not issecretvalue(name))
-            and (loaded or loaded == nil and loading) and security ~= "SECURE" and not name:match("^Blizzard_") then
-            names[#names + 1] = name
-        end
+        local first, loaded = addons.IsAddOnLoaded(index)
+        if type(name) == "string" and not (issecretvalue and issecretvalue(name)) and security ~= "SECURE"
+            and not name:match("^Blizzard_") and (loaded or loaded == nil and first) then names[#names + 1] = name end
     end
+    table.sort(names, function(a, b) if a == b then return false elseif a == addonName then return true elseif b == addonName then return false end return a < b end)
     return names
 end
-
-local function Order(left, right)
-    if left.value ~= right.value then return left.value > right.value end
-    return left.name < right.name
+local function Version(name)
+    if not addons.GetAddOnMetadata then return end
+    local ok, value = pcall(addons.GetAddOnMetadata, name, "Version")
+    return ok and ns.CleanText(value, 40) or nil
 end
-
-local function Top(mode)
-    local spec = topModes[mode]
-    if not spec then
-        Print(Text("Режимы top: recent, peak, spikes, memory.", "Top modes: recent, peak, spikes, memory."))
-        return
-    end
-    if mode == "memory" then
-        if not (UpdateAddOnMemoryUsage and GetAddOnMemoryUsage) then
-            Print(Text("Счетчики памяти недоступны.", "Memory counters unavailable."))
-            return
-        end
-        UpdateAddOnMemoryUsage()
-    end
-    local ranked = {}
-    for _, name in ipairs(LoadedAddons()) do
-        local value
-        if mode == "memory" then
-            local kib = ReadNumber(GetAddOnMemoryUsage, name)
-            value = kib and kib / 1024
-        else
-            value = Read(name, spec[1])
-        end
-        if value and value > 0 then ranked[#ranked + 1] = { name = name, value = value } end
-    end
-    table.sort(ranked, Order)
-    Print(spec[2])
-    if mode == "recent" then
-        local overall, frame = RecentTimes()
-        if overall and frame then
-            Print(Text(("Все аддоны %.3f мс · клиент %.3f мс"):format(overall, frame),
-                ("All addons %.3f ms · client %.3f ms"):format(overall, frame)))
-        end
-    end
-    for index = 1, math.min(8, #ranked) do
-        local row = ranked[index]
-        Print(("%d. %s  " .. spec[3]):format(index, row.name, row.value))
-    end
-    if #ranked == 0 then Print(Text("Пока нет ненулевых значений.", "No nonzero values yet.")) end
+local function MarkMemory()
+    memoryGeneration = memoryGeneration + 1
+    scannedAt, scannedUnix = clock(), time()
 end
-
-local function Counts(name)
-    return Read(name, thresholds[1]), Read(name, thresholds[2]), Read(name, thresholds[3])
+if type(hooksecurefunc) == "function" and type(UpdateAddOnMemoryUsage) == "function" then hooksecurefunc("UpdateAddOnMemoryUsage", MarkMemory) end
+function ns.Memory(force)
+    if ns.DevRunning and ns.DevRunning() then
+        if force then memoryRequested=true end
+        return memory,"deferred"
+    end
+    local now = clock()
+    local blocked = active ~= nil or InCombatLockdown()
+    if force and blocked then memoryRequested = true end
+    local stale = not scannedAt or now - scannedAt >= 60
+    if not blocked and type(UpdateAddOnMemoryUsage) == "function" and (force or memoryRequested or stale and settings and not settings.memoryManual) then
+        local generation = memoryGeneration
+        local ok = pcall(UpdateAddOnMemoryUsage)
+        if ok then
+            memoryRequested = false
+            if generation == memoryGeneration then MarkMemory() end
+        end
+    end
+    if scannedAt and (not memory or memory.generation ~= memoryGeneration) then
+        local result = { values = {}, total = 0, at = scannedAt, timestamp = scannedUnix, generation = memoryGeneration }
+        local valid = false
+        for _, name in ipairs(Loaded()) do
+            local kb = Read(GetAddOnMemoryUsage, name)
+            if kb then result.values[name] = kb / 1024; result.total = result.total + kb / 1024; valid = true end
+        end
+        if valid then memory = result; ns.NoteMemory(result) end
+    end
+    return memory, blocked and "deferred" or memory and (now - memory.at >= 60 and "stale" or "fresh") or "unavailable"
 end
-
-function ns.Snapshot(memory, maxMemoryAge)
-    local available = memory and AddOnsAvailable() or not memory and Available()
-    local rows, summary = {}, nil
-    if memory then
-        if not (available and UpdateAddOnMemoryUsage and GetAddOnMemoryUsage) then return rows end
-        if not maxMemoryAge or not memoryScannedAt or GetTime() - memoryScannedAt >= maxMemoryAge then
-            if not pcall(UpdateAddOnMemoryUsage) then return rows end
-            MarkMemoryScan()
-        end
-    else
-        local overall, frame
-        if available then overall, frame = RecentTimes() end
-        local fps = ReadNumber(GetFramerate)
-        summary = { overall = overall, frame = frame, share = FrameShare(overall, frame),
-            fps = fps and fps > 0 and fps or nil, fpsCost = EstimateFPSCost(overall, fps) }
+function ns.Snapshot()
+    local rows, summary = {}, { fps = Read(GetFramerate), updated = time() }
+    if not ns.Available() then
+        if memory then for name, value in pairs(memory.values) do rows[#rows + 1] = { name = name, memory = value } end end
+        return rows, summary
     end
-    if not available then return rows, summary end
-    for _, name in ipairs(LoadedAddons()) do
-        if memory then
-            local kib = ReadNumber(GetAddOnMemoryUsage, name)
-            if kib then rows[#rows + 1] = { name = name, memory = kib / 1024 } end
-        else
-            local recent = Read(name, "RecentAverageTime")
-            rows[#rows + 1] = {
-                name = name, recent = recent, average = Read(name, "SessionAverageTime"),
-                peak = Read(name, "PeakTime"), share = FrameShare(recent, summary.frame),
-            }
-        end
+    summary.overall = Metric(nil, "RecentAverageTime")
+    summary.frame = Read(api.GetApplicationMetric, metrics.RecentAverageTime)
+    if summary.overall and summary.frame and summary.frame > 0 then summary.share = summary.overall / summary.frame * 100 end
+    for _, name in ipairs(Loaded()) do
+        rows[#rows + 1] = { name = name, average = Metric(name, "RecentAverageTime"), peak = Metric(name, "PeakTime"),
+            five = Metric(name, thresholds[1]), ten = Metric(name, thresholds[2]), fifty = Metric(name, thresholds[3]), memory = memory and memory.values[name] }
     end
-    if memory then return rows, memoryScannedAt, memoryUpdated end
     return rows, summary
 end
-
-local function Add(record, name, new)
-    if record.rows[name] then return end
-    local five, ten, fifty, peak
-    if new then five, ten, fifty, peak = 0, 0, 0, 0
-    else
-        five, ten, fifty = Counts(name)
-        peak = Read(name, "PeakTime")
-    end
-    if five == nil then return end
-    record.rows[name] = {
-        start5 = five, last5 = five, start10 = ten, last10 = ten, start50 = fifty, last50 = fifty,
-        startPeak = peak, value = 0, ten = ten and 0, fifty = fifty and 0,
-    }
-end
-
-local function TrackAddOnLoads()
-    if not loader then
-        loader = CreateFrame("Frame")
-        loader:SetScript("OnEvent", function(_, _, name)
-            if type(name) ~= "string" or issecretvalue and issecretvalue(name)
-                or name == addonName or name:match("^Blizzard_") then return end
-            local _, _, _, _, _, security = addons.GetAddOnInfo(name)
-            if security == "SECURE" then return end
-            if active then Add(active, name, true) end
-            if background and background.ticker then Add(background, name, true) end
-        end)
-    end
-    if active or background and background.ticker then loader:RegisterEvent("ADDON_LOADED")
-    else loader:UnregisterEvent("ADDON_LOADED") end
-end
-
-local function Delta(now, before)
-    if now and before and now >= before then return now - before end
-end
-
-local function ReadSpikes(record, overall)
-    if overall == nil or record.lastOverall == overall then return end
-    local overallIncrease = Delta(overall, record.lastOverall)
-    record.lastOverall = overall
-    local total, total10, total50 = 0, 0, 0
-    local contributors
-    for name, row in pairs(record.rows) do
-        local counter = Read(name, thresholds[1])
-        local increase = Delta(counter, row.last5)
-        if increase and increase > 0 then
-            local ten, fifty = Read(name, thresholds[2]), Read(name, thresholds[3])
-            local added10, added50 = Delta(ten, row.last10) or 0, Delta(fifty, row.last50) or 0
-            row.value, row.ten, row.fifty = Delta(counter, row.start5), Delta(ten, row.start10), Delta(fifty, row.start50)
-            row.last5, row.last10, row.last50 = counter, ten, fifty
-            total = total + increase
-            total10 = total10 + math.min(added10, increase)
-            total50 = total50 + math.min(added50, added10, increase)
-            contributors = contributors or {}
-            contributors[#contributors + 1] = { name = name, value = increase }
-        end
-    end
-    if contributors then
-        table.sort(contributors, Order)
-        for index = #contributors, 9, -1 do contributors[index] = nil end
-    end
-    return contributors, total, total10, total50, overallIncrease
-end
-
-local function Sample(record)
-    local overall = Read(nil, thresholds[1])
-    if overall == nil then return end
-    record.updated = date("%H:%M:%S")
-    local contributors, total, total10, total50 = ReadSpikes(record, overall)
-    if not contributors then return end
-    local leader = contributors[1]
-    local elapsed = GetTime() - record.started
-    local bin = math.max(1, math.min(record.duration, math.ceil(elapsed)))
-    local point = record.timeline[#record.timeline]
-    if point and point.bin == bin then
-        point.total, point.ten, point.fifty = point.total + total, point.ten + total10, point.fifty + total50
-        local values, merged = {}, {}
-        for _, entry in ipairs(point.contributors) do values[entry.name] = entry.value end
-        for _, entry in ipairs(contributors) do values[entry.name] = (values[entry.name] or 0) + entry.value end
-        for name, count in pairs(values) do merged[#merged + 1] = { name = name, value = count } end
-        table.sort(merged, Order)
-        for index = #merged, 9, -1 do merged[index] = nil end
-        point.contributors, point.name, point.count = merged, merged[1].name, merged[1].value
-    else
-        record.timeline[#record.timeline + 1] = {
-            bin = bin, elapsed = elapsed, name = leader.name, count = leader.value, total = total, ten = total10,
-            fifty = total50, contributors = contributors,
-        }
+local function Counts(name) return Metric(name, thresholds[1]), Metric(name, thresholds[2]), Metric(name, thresholds[3]) end
+local function Delta(now, before) if now and before and now >= before then return now - before end end
+local function Notify() if ns.OnDataChanged then ns.OnDataChanged() end end
+local contextEvents = { "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED", "ENCOUNTER_START", "ENCOUNTER_END", "ZONE_CHANGED_NEW_AREA", "GROUP_ROSTER_UPDATE" }
+local function TrackLoads()
+    if active or background or armed then events:RegisterEvent("ADDON_LOADED") else events:UnregisterEvent("ADDON_LOADED") end
+    for _, name in ipairs(contextEvents) do
+        if active or armed then
+            local ok = pcall(events.RegisterEvent, events, name)
+            if not ok then if active then active.contextChanged = true end;if armed then armed.contextChanged = true end end
+        else events:UnregisterEvent(name) end
     end
 end
-
-local function CountText(value)
-    return value and tostring(value) or "—"
+local function Build()
+    if not GetBuildInfo then return "WoW Forever" end
+    local version, build = GetBuildInfo()
+    return tostring(version) .. "." .. tostring(build)
 end
-
-local function Report(record)
-    Print(Text(("Замер %.1f с. Кадры аддонов >5 / >10 / >50 мс."):format(record.elapsed),
-        ("%.1f s capture. Addon frames >5 / >10 / >50 ms."):format(record.elapsed)))
-    for index = 1, math.min(6, #record.ranked) do
-        local row = record.ranked[index]
-        local peak = row.peak and Text("  новый пик %.2f мс", "  new peak %.2f ms"):format(row.peak) or ""
-        Print(("%s  %d / %s / %s%s"):format(row.name, row.value, CountText(row.ten), CountText(row.fifty), peak))
-    end
-    if #record.ranked == 0 then Print(Text("Спайков >5 мс за замер не найдено.", "No >5 ms addon spikes found.")) end
-    if #record.timeline > 0 then
-        Print(Text("Последние интервалы замера", "Latest sample windows"))
-        for index = math.max(1, #record.timeline - 5), #record.timeline do
-            local point = record.timeline[index]
-            Print(Text("+%.1f с  %s ×%d  (всего отметок %d)", "+%.1f s  %s ×%d  (total samples %d)")
-                :format(point.elapsed, point.name, point.count, point.total))
-        end
+local function NewPoint(from, to)
+    return { from = from, to = to, frames = 0, samples = 0, total = 0, peak = 0, five = 0, ten = 0, fifty = 0,
+        individualFive = 0, missing = 0, addonMissing = 0, long50 = 0, frameSamples = 0,
+        framePeak = 0, frameAt = 0, cpuAtFramePeak = false, perfAtFramePeak = false,
+        contributors = { { name = "", value = 0 }, { name = "", value = 0 }, { name = "", value = 0 } } }
+end
+local function Top(point, name, value)
+    local entries, found = point.contributors
+    for i = 1, 3 do if entries[i].name == name then found = i; break end end
+    if not found then if value <= entries[3].value then return end; found = 3; entries[3].name = name end
+    entries[found].value = value
+    while found > 1 and entries[found].value > entries[found - 1].value do
+        entries[found], entries[found - 1] = entries[found - 1], entries[found]
+        found = found - 1
     end
 end
-
-local function Stop(showReport)
+local function AddRow(record, name)
+    if record.byName[name] then return end
+    if #record.rows >= ns.MAX_ADDONS then record.omitted = record.omitted + 1; return end
+    local row = { name = name, version = Version(name), total = 0, samples = 0, peak = 0, five = 0, ten = 0, fifty = 0,
+        missing = 0, bin = 0, binCount = 0, memory = record.memoryValues and record.memoryValues[name] }
+    record.rows[#record.rows + 1], record.byName[name] = row, row
+end
+local function Accumulate(row, value)
+    row.samples, row.total = row.samples + 1, row.total + value
+    if value > row.peak then row.peak = value end
+    if value > 5 then
+        row.five = row.five + 1
+        if value > 10 then row.ten = row.ten + 1; if value > 50 then row.fifty = row.fifty + 1 end end
+    end
+end
+local ResetBackground
+function ns.Stop(reason)
     local record = active
     if not record then return end
     active = nil
-    record.ticker:Cancel()
-    TrackAddOnLoads()
-    Sample(record)
-    record.elapsed = GetTime() - record.started
-    record.ranked = {}
-    for name, row in pairs(record.rows) do
-        local five, ten, fifty = Counts(name)
-        local peak = Read(name, "PeakTime")
-        row.value, row.ten, row.fifty = Delta(five, row.start5), Delta(ten, row.start10), Delta(fifty, row.start50)
-        row.peak = peak and row.startPeak and peak > row.startPeak and peak or nil
-        row.name = name
-        if row.value and row.value > 0 then record.ranked[#record.ranked + 1] = row end
+    collector:SetScript("OnUpdate", nil)
+    record.duration = math.max(0, clock() - (record.started or clock()))
+    record.reason = reason
+    record.complete = reason == nil or reason == "combat_end" or reason == "encounter_end"
+    if not record.complete then record.group = nil end
+    ns.FinishFrameStats(record)
+    record.memoryTrail = ns.CopyMemoryTrail()
+    record.average = record.samples > 0 and record.total / record.samples or nil
+    if record.samples == 0 then record.peak, record.five, record.ten, record.fifty = nil, nil, nil, nil end
+    record.costAverage = record.costSamples > 0 and record.costTotal / record.costSamples or nil
+    if record.costSamples == 0 then record.costPeak = nil end
+    for _, row in ipairs(record.rows) do
+        row.average = row.samples > 0 and row.total / row.samples or nil
+        if row.samples == 0 then row.peak, row.five, row.ten, row.fifty = nil, nil, nil, nil end
     end
-    table.sort(record.ranked, Order)
-    last = record
-    if showReport or not record.silent then Report(record) end
-    if ns.OnCaptureChanged then ns.OnCaptureChanged() end
+    local used = math.min(#record.timeline, math.max(1, math.ceil(record.duration)))
+    for i = #record.timeline, used + 1, -1 do record.timeline[i] = nil end
+    for index, point in ipairs(record.timeline) do
+        point.to = index == used and record.duration or math.min(point.to, record.duration)
+        point.average = point.samples > 0 and point.total / point.samples or nil
+        if point.samples == 0 then point.peak, point.five, point.ten, point.fifty = nil, nil, nil, nil end
+    end
+    last = ns.SaveRecord(record)
+    if background then ResetBackground() end
+    TrackLoads()
+    Notify()
+    return last
 end
-ns.Stop = Stop
-
-local function Watch(argument, silent)
-    if active then
-        Print(Text("Замер уже идет. Остановить можно командой /sperf stop.", "A capture is running. Use /sperf stop."))
-        return
+local function Sample(_, frameElapsed)
+    local record = active
+    if not record then return end
+    local now = clock()
+    -- LastTime belongs to the previous tick; discard the first callback after arming.
+    if not record.started then record.started = now; return end
+    local startedCost = profileClock and profileClock()
+    local elapsed = now - record.started
+    local binIndex = math.min(#record.timeline, math.max(1, math.floor(elapsed) + 1))
+    local point = record.timeline[binIndex]
+    local overall = Read(api.GetOverallMetric, metrics.LastTime)
+    local observer
+    record.frames, point.frames = record.frames + 1, point.frames + 1
+    if overall then Accumulate(record, overall); Accumulate(point, overall)
+    else record.missing, point.missing = record.missing + 1, point.missing + 1 end
+    for i = 1, #record.rows do
+        local row = record.rows[i]
+        local value = Read(api.GetAddOnMetric, row.name, metrics.LastTime)
+        if row.name == addonName then observer = value end
+        if value then
+            Accumulate(row, value)
+            if value > 5 then
+                if row.bin ~= binIndex then row.bin, row.binCount = binIndex, 0 end
+                row.binCount = row.binCount + 1
+                point.individualFive = point.individualFive + 1
+                Top(point, row.name, row.binCount)
+            end
+        else row.missing = row.missing + 1; point.addonMissing = point.addonMissing + 1 end
     end
-    local seconds = argument == "" and 30 or tonumber(argument)
-    if not seconds or seconds ~= math.floor(seconds) or seconds < 5 or seconds > 120 then
-        Print(Text("Длительность замера от 5 до 120 секунд.", "Capture duration must be 5 to 120 seconds."))
-        return
+    ns.SampleFrame(record, point, frameElapsed, overall, observer, elapsed)
+    if startedCost then
+        local cost = Number(profileClock() - startedCost)
+        if cost then
+            record.costSamples, record.costTotal = record.costSamples + 1, record.costTotal + cost
+            record.costPeak = math.max(record.costPeak, cost)
+            record.windowCost, record.windowSamples = record.windowCost + cost, record.windowSamples + 1
+            if cost > 20 or record.windowSamples >= ns.COST_WINDOW and record.windowCost / record.windowSamples > ns.COST_BUDGET_MS then ns.Stop("overhead"); return end
+            if record.windowSamples >= ns.COST_WINDOW then record.windowCost, record.windowSamples = 0, 0 end
+        end
     end
-    if not (C_Timer and C_Timer.NewTicker) then
-        Print(Text("Запись замера недоступна.", "Timed captures unavailable."))
-        return
-    end
-    local record = { rows = {}, timeline = {}, duration = seconds, silent = silent }
-    for _, name in ipairs(LoadedAddons()) do Add(record, name) end
-    record.lastOverall = Read(nil, thresholds[1])
-    if record.lastOverall ~= nil then record.updated = date("%H:%M:%S") end
-    record.started = GetTime()
-    record.deadline = record.started + seconds
+    if record.missing >= 60 and record.samples == 0 then ns.Stop("unavailable") elseif elapsed >= record.requested then ns.Stop() end
+end
+local function Prepare(seconds, options)
+    if active or not ns.Available() then return end
+    seconds = tonumber(seconds) or 30
+    if not Number(seconds) or seconds < 5 or seconds > 120 or seconds ~= math.floor(seconds) then return end
+    options = options or {}
+    -- Reuse an existing snapshot: starting capture must not trigger a memory walk.
+    local record = { kind = "capture", name = L("Замер ", "Capture ") .. date("%H:%M:%S"), timestamp = time(),
+        requested = seconds, duration = 0, frames = 0, samples = 0, total = 0, peak = 0, five = 0, ten = 0, fifty = 0,
+        missing = 0, rows = {}, byName = {}, timeline = {}, omitted = 0, costTotal = 0, costSamples = 0, costPeak = 0,
+        windowCost = 0, windowSamples = 0, build = Build(), memoryValues = memory and memory.values,
+        memoryTimestamp = memory and memory.timestamp, memoryAge = memory and clock() - memory.at, memoryState = memory and "before_capture" or "unavailable" }
+    record.profile = options.profile == "light" and "light" or "detailed"
+    record.trigger = options.trigger == "combat" and "combat" or options.trigger == "boss" and "boss" or "manual"
+    record.scenario = ns.CleanText(options.scenario,160) or settings and settings.scenario or L("Мой сценарий","My scenario")
+    record.group = options.group == "A" and "A" or options.group == "B" and "B" or nil
+    ns.BeginFrameStats(record)
+    record.memoryTrail = ns.CopyMemoryTrail()
+    for i = 1, seconds do record.timeline[i] = NewPoint(i - 1, i) end
+    if record.profile == "light" then AddRow(record, addonName)
+    else for _, name in ipairs(Loaded()) do AddRow(record, name) end end
+    return record
+end
+local function Activate(record)
+    record.timestamp, record.context = time(), ns.ReadContext()
+    record.name = record.scenario .. " · " .. date("%H:%M:%S")
+    record.memoryValues = memory and memory.values
+    record.memoryTimestamp, record.memoryAge = memory and memory.timestamp, memory and clock() - memory.at
+    for _, row in ipairs(record.rows) do row.memory = memory and memory.values[row.name] end
     active = record
-    TrackAddOnLoads()
-    record.ticker = C_Timer.NewTicker(1, function()
-        if GetTime() >= record.deadline then
-            Stop()
-        else
-            Sample(record)
-            if ns.OnCaptureChanged then ns.OnCaptureChanged() end
-        end
-    end)
-    if not silent then
-        Print(Text(("Замер запущен на %d с."):format(seconds), ("Capturing for %d s."):format(seconds)))
-    end
-    if ns.OnCaptureChanged then ns.OnCaptureChanged() end
-end
-ns.Watch = Watch
-
-local function SampleBackground(record)
-    local overall = Read(nil, thresholds[1])
-    record.readable = overall ~= nil
-    if overall == nil then return end
-    local now, previous = GetTime(), record.checked
-    record.checked, record.updated = now, date("%H:%M:%S")
-    if overall < record.lastOverall then
-        record.lastOverall = overall
-        record.rows = {}
-        for _, name in ipairs(LoadedAddons()) do Add(record, name) end
-        return
-    end
-    local contributors, total, ten, fifty, increase = ReadSpikes(record, overall)
-    if not increase then return end
-    local windows = record.windows
-    if #windows == backgroundWindows then table.remove(windows, 1) end
-    windows[#windows + 1] = {
-        ended = now, elapsed = now - previous, overall = increase,
-        from = previous - record.started, bin = now - record.started,
-        total = total, ten = ten, fifty = fifty, contributors = contributors or {},
-    }
-end
-
-local function StartBackground()
-    if not (Available() and C_Timer and C_Timer.NewTicker) then return end
-    local overall = Read(nil, thresholds[1])
-    if overall == nil then return end
-    local record = { rows = {}, windows = {}, lastOverall = overall, readable = true }
-    for _, name in ipairs(LoadedAddons()) do Add(record, name) end
-    record.checked = GetTime()
-    record.updated = date("%H:%M:%S")
-    record.started, record.interval = record.checked, backgroundInterval
-    record.ticker = C_Timer.NewTicker(backgroundInterval, function()
-        SampleBackground(record)
-        if ns.OnBackgroundSample then ns.OnBackgroundSample() end
-        if ns.OnBackgroundTimelineChanged then ns.OnBackgroundTimelineChanged(true) end
-    end)
-    background = record
-    TrackAddOnLoads()
+    collector:SetScript("OnUpdate", Sample)
+    TrackLoads()
+    Notify()
     return true
 end
-
-function ns.InitBackground(db)
-    settings = db
-    if settings.background == true and not background then StartBackground() end
+function ns.CancelArm()
+    if not armed then return end
+    if armed.expiry then armed.expiry:Cancel() end
+    armed = nil
+    TrackLoads(); Notify()
 end
-
-function ns.BackgroundEnabled()
-    return settings and settings.background == true
+function ns.Start(seconds, options)
+    if active or ns.DevRunning and ns.DevRunning() then return false end
+    ns.CancelArm()
+    local record = Prepare(seconds, options)
+    return record and Activate(record) or false
 end
-
-function ns.SetBackgroundEnabled(enabled)
-    if enabled then
-        if not (background and background.ticker) and not StartBackground() then return false end
-    elseif background and background.ticker then
-        background.ticker:Cancel()
-        background.ticker = nil
-        TrackAddOnLoads()
-        SampleBackground(background)
-        background.rows = nil
-    end
-    if settings then settings.background = enabled end
-    if ns.OnBackgroundChanged then ns.OnBackgroundChanged() end
-    if ns.OnBackgroundTimelineChanged then ns.OnBackgroundTimelineChanged() end
+function ns.ArmCapture(seconds, options)
+    if active or ns.DevRunning and ns.DevRunning() then return false end
+    options = options or {}
+    if options.trigger == nil or options.trigger == "manual" then return ns.Start(seconds, options) end
+    ns.CancelArm()
+    if not (C_Timer and C_Timer.NewTicker) then return false end
+    local record = Prepare(seconds, options)
+    if not record then return false end
+    local required = record.trigger == "boss" and "ENCOUNTER_START" or "PLAYER_REGEN_DISABLED"
+    if not pcall(events.RegisterEvent, events, required) then return false end
+    armed = record; record.waitStarted = clock()
+    record.expiry = C_Timer.NewTicker(300, function()
+        if armed == record then ns.CancelArm(); print(L("Sintezza Perf: ожидание события истекло (5 минут).", "Sintezza Perf: event wait expired (5 minutes).")) end
+    end)
+    TrackLoads(); Notify()
     return true
 end
-
-function ns.BackgroundCapture()
-    return background, background and background.ticker ~= nil
+function ns.Armed() return armed end
+function ns.Mark(text)
+    if not active then return false end
+    local ok = ns.AddContextMarker(active, "manual", text or L("Ручная метка", "Manual marker"), ns.Elapsed())
+    Notify(); return ok
 end
-
-function ns.BackgroundReport(sample)
-    if not background then
-        if ns.BackgroundEnabled() then
-            return { Text("Фоновый сбор недоступен.", "Background monitoring unavailable.") }
-        end
-        return { Text("Фоновый сбор выключен.", "Background monitoring off.") }
-    end
-    if sample and background.ticker then SampleBackground(background) end
-    local lines = { background.ticker and Text("Фоновый сбор идет.", "Background monitoring active.")
-        or Text("Фоновый сбор остановлен.", "Background monitoring stopped.") }
-    if background.ticker and not background.readable then
-        lines[1] = Text("Счетчики фона временно недоступны.", "Background counters temporarily unavailable.")
-    end
-    if #background.windows == 0 then
-        lines[2] = Text("Спайков >5 мс пока нет.", "No >5 ms spikes recorded yet.")
-        return lines
-    end
-    lines[2] = Text("Кадры всех аддонов вместе >5 мс | отметки отдельных аддонов >5 / >10 / >50 мс.",
-        "Combined addon frames >5 ms | per-addon counts >5 / >10 / >50 ms.")
-    local now = GetTime()
-    for index = #background.windows, 1, -1 do
-        local point = background.windows[index]
-        local names = {}
-        for contributor = 1, math.min(3, #point.contributors) do
-            local entry = point.contributors[contributor]
-            names[contributor] = ("%s ×%d"):format(entry.name, entry.value)
-        end
-        local interval = Text("%.0f с назад (за %.1f с)", "%.0f s ago (over %.1f s)")
-            :format(now - point.ended, point.elapsed)
-        lines[#lines + 1] = ("%s  %d | %d / %d / %d  %s"):format(interval, point.overall,
-            point.total, point.ten, point.fifty, table.concat(names, ", "))
-    end
-    return lines
-end
-
-local function BackgroundCommand(argument)
-    if argument == "on" then
-        if ns.SetBackgroundEnabled(true) then
-            Print(Text("Фоновый сбор включен. Отчет: /sperf background.", "Background monitoring on. Report: /sperf background."))
-        else
-            Print(Text("Фоновый сбор недоступен.", "Background monitoring unavailable."))
-        end
-    elseif argument == "off" then
-        ns.SetBackgroundEnabled(false)
-        Print(Text("Фоновый сбор выключен.", "Background monitoring off."))
-    elseif argument == "" or argument == "report" then
-        if not background and not ns.BackgroundEnabled() then
-            Print(Text("Запусти фоновый сбор командой /sperf background on.", "Start monitoring with /sperf background on."))
-        else
-            for _, line in ipairs(ns.BackgroundReport(true)) do Print(line) end
-        end
-    else
-        Print("/sperf background [on|off|report]")
-    end
-end
-
 function ns.Capture()
+    if not active and last and not ns.FindRecord(last.id) then
+        last = nil
+        for _, record in ipairs(ns.History()) do if record.kind == "capture" then last = record; break end end
+    end
     return active or last, active ~= nil
 end
-
-local function ShowTime(value)
-    return value and Text("%.3f мс", "%.3f ms"):format(value) or "—"
-end
-
-local function Inspect(search)
-    if search == "" then Print(Text("/sperf info <папка аддона>", "/sperf info <addon folder>")); return end
-    search = search:lower()
-    local match, matches = nil, 0
-    for _, name in ipairs(LoadedAddons()) do
-        local lower = name:lower()
-        if lower == search then match, matches = name, 1; break end
-        if lower:sub(1, #search) == search then match, matches = name, matches + 1 end
+function ns.Elapsed() return active and active.started and clock() - active.started or 0 end
+ResetBackground = function()
+    if not background then return end
+    background.overall5, background.overall10, background.overall50 = Counts(nil)
+    background.at, background.rows = clock(), {}
+    local names = Loaded()
+    background.omitted = math.max(0, #names - ns.MAX_ADDONS)
+    for i = 1, math.min(#names, ns.MAX_ADDONS) do
+        local name = names[i]
+        local five, ten, fifty = Counts(name)
+        background.rows[name] = { five = five, ten = ten, fifty = fifty, version = Version(name) }
     end
-    if matches ~= 1 then
-        Print(Text("Укажи точное имя папки загруженного аддона.", "Use the exact folder name of a loaded addon."))
+end
+function ns.ResetBackgroundBaseline() if background then ResetBackground() end end
+local function SampleBackground()
+    if not background or active or ns.DevRunning and ns.DevRunning() then return end
+    local overall = Metric(nil, thresholds[1])
+    if overall == nil then background.unavailable = true; return end
+    if background.unavailable or not background.overall5 or overall < background.overall5 then background.unavailable = nil; ResetBackground(); return end
+    if overall == background.overall5 then background.at = clock(); return end
+    local now, ten, fifty = clock(), Metric(nil, thresholds[2]), Metric(nil, thresholds[3])
+    local record = { kind = "background", name = L("Фоновый эпизод ", "Background episode ") .. date("%H:%M:%S"), timestamp = time(),
+        duration = now - background.at, five = Delta(overall, background.overall5), ten = Delta(ten, background.overall10), fifty = Delta(fifty, background.overall50),
+        rows = {}, timeline = {}, build = Build(), omitted = background.omitted, memoryState = "unavailable" }
+    local point = NewPoint(0, record.duration)
+    point.frames, point.samples, point.peak, point.total = nil, nil, nil, nil
+    point.five, point.ten, point.fifty = record.five, record.ten, record.fifty
+    for name, previous in pairs(background.rows) do
+        local fiveNow, tenNow, fiftyNow = Counts(name)
+        local count = Delta(fiveNow, previous.five)
+        if count == nil then point.addonMissing = point.addonMissing + 1 end
+        if count and (count > 0 or name == addonName) then
+            record.rows[#record.rows + 1] = { name = name, five = count, ten = Delta(tenNow, previous.ten), fifty = Delta(fiftyNow, previous.fifty), version = previous.version }
+            point.individualFive = point.individualFive + count
+            Top(point, name, count)
+        end
+        previous.five, previous.ten, previous.fifty = fiveNow, tenNow, fiftyNow
+    end
+    record.timeline[1] = point
+    ns.SaveRecord(record)
+    background.overall5, background.overall10, background.overall50, background.at = overall, ten, fifty, now
+    Notify()
+end
+function ns.BackgroundEnabled() return settings and settings.background == true end
+function ns.BackgroundAvailable() return background and not background.unavailable end
+function ns.SetBackgroundEnabled(enabled)
+    if background and background.ticker then background.ticker:Cancel() end
+    background = nil
+    if enabled then
+        if not ns.Available() or not C_Timer or not C_Timer.NewTicker then return false end
+        background = {}; ResetBackground()
+        background.ticker = C_Timer.NewTicker(5, SampleBackground)
+    end
+    if settings then settings.background = enabled == true end
+    TrackLoads(); Notify()
+    return true
+end
+events:SetScript("OnEvent", function(_, event, name, encounterName, difficulty, groupSize)
+    if event == "PLAYER_LOGOUT" then ns.CancelArm(); if active then ns.Stop("logout") end; return end
+    if armed and (armed.trigger == "combat" and event == "PLAYER_REGEN_DISABLED" or armed.trigger == "boss" and event == "ENCOUNTER_START") then
+        local record = armed
+        if record.expiry then record.expiry:Cancel() end
+        armed = nil
+        if event == "ENCOUNTER_START" then record.encounterID = Number(name) end
+        Activate(record)
+        ns.AddContextMarker(record,"start",event == "ENCOUNTER_START" and L("Начало боя с боссом","Boss encounter started") or L("Начало боя","Combat started"),0)
         return
     end
-    Print(("%s  %s %s  %s %s  %s %s"):format(match, Text("среднее за сеанс", "session avg"),
-        ShowTime(Read(match, "SessionAverageTime")), Text("недавнее", "recent"),
-        ShowTime(Read(match, "RecentAverageTime")), Text("пик", "peak"), ShowTime(Read(match, "PeakTime"))))
-    local five, ten, fifty = Counts(match)
-    Print(Text("Кадры за сеанс >1 / >5 / >10 / >50 мс  %s / %s / %s / %s",
-        "Session frames >1 / >5 / >10 / >50 ms  %s / %s / %s / %s")
-        :format(CountText(Read(match, "CountTimeOver1Ms")), CountText(five), CountText(ten), CountText(fifty)))
-    local row = last and last.rows[match]
-    if row then
-        Print(Text("Последний замер >5 / >10 / >50 мс  %s / %s / %s", "Last capture >5 / >10 / >50 ms  %s / %s / %s")
-            :format(CountText(row.value), CountText(row.ten), CountText(row.fifty)))
+    if active and event ~= "ADDON_LOADED" then
+        local elapsed = ns.Elapsed()
+        if event == "PLAYER_REGEN_DISABLED" then ns.AddContextMarker(active,"combat_start",L("Начало боя","Combat started"),elapsed)
+        elseif event == "PLAYER_REGEN_ENABLED" then
+            ns.AddContextMarker(active,"combat_end",L("Конец боя","Combat ended"),elapsed)
+            if active.trigger == "combat" then ns.Stop("combat_end") end
+        elseif event == "ENCOUNTER_START" then ns.AddContextMarker(active,"boss_start",L("Начало боя с боссом","Boss encounter started"),elapsed)
+        elseif event == "ENCOUNTER_END" then
+            ns.AddContextMarker(active,"boss_end",L("Конец боя с боссом","Boss encounter ended"),elapsed)
+            if active.trigger == "boss" and active.encounterID and Number(name) == active.encounterID then ns.Stop("encounter_end") end
+        elseif event == "ZONE_CHANGED_NEW_AREA" or event == "GROUP_ROSTER_UPDATE" then
+            active.contextChanged = true
+            ns.AddContextMarker(active,event,L("Изменились зона или состав группы","Zone or group composition changed"),elapsed)
+        end
+        return
     end
+    if type(name) ~= "string" or issecretvalue and issecretvalue(name) or name:match("^Blizzard_") then return end
+    if active and active.profile == "detailed" then AddRow(active, name) end
+    if armed and armed.profile == "detailed" then AddRow(armed, name) end
+    if background and not background.rows[name] then
+        if #Loaded() <= ns.MAX_ADDONS then background.rows[name] = { five = 0, ten = 0, fifty = 0, version = Version(name) }
+        else background.omitted = background.omitted + 1 end
+    end
+end)
+events:RegisterEvent("PLAYER_LOGOUT")
+function ns.InitCollector(storage)
+    settings = storage
+    for _, record in ipairs(ns.History()) do if record.kind == "capture" then last = record; break end end
+    if settings.background then ns.SetBackgroundEnabled(true) end
 end
-
 SLASH_SINTEZZAPERF1 = "/sperf"
 SlashCmdList.SINTEZZAPERF = function(message)
-    local command, argument = message:match("^%s*(%S*)%s*(.-)%s*$")
+    local command, argument = (message or ""):match("^(%S*)%s*(.-)$")
     command = command:lower()
-    if command == "" and ns.Toggle then ns.Toggle(); return end
-    if command == "" or command == "help" then
-        Print(Text("/sperf top [recent|peak|spikes|memory], /sperf info <папка аддона>",
-            "/sperf top [recent|peak|spikes|memory], /sperf info <addon folder>"))
-        Print("/sperf watch [5–120], /sperf stop, /sperf report, /sperf minimap")
-        Print("/sperf background [on|off|report]")
-        return
-    end
-    if command == "minimap" and ns.ToggleMinimap then ns.ToggleMinimap(); return end
-    if command == "background" then BackgroundCommand(argument:lower()); return end
-    if command == "stop" then
-        if active then Stop(true) else Print(Text("Замер сейчас не идет.", "No capture is running.")) end
-        return
-    end
-    if command == "report" then
-        if last then Report(last) else Print(Text("Сначала запусти /sperf watch.", "Start with /sperf watch.")) end
-        return
-    end
-    if not Available() then
-        Print(Text("Штатный профайлер WoW недоступен.", "The built-in WoW profiler is unavailable."))
-        return
-    end
-    if command == "top" then Top(argument == "" and "recent" or argument:lower())
-    elseif command == "info" then Inspect(argument)
-    elseif command == "watch" then Watch(argument)
-    else Print("/sperf help") end
+    if command == "" then if ns.Toggle then ns.Toggle() end
+    elseif command == "minimap" then if ns.ToggleMinimap then ns.ToggleMinimap() end
+    elseif command == "watch" then if not ns.Start(argument ~= "" and argument or 30) then print(L("Замер недоступен или уже идет.", "Capture unavailable or already running.")) end
+    elseif command == "dev" then if ns.OpenDeveloper then ns.OpenDeveloper() end
+    elseif command == "stop" then if ns.DevRunning and ns.DevRunning() then ns.DevStop("manual") elseif ns.Armed() then ns.CancelArm() else ns.Stop("manual") end
+    elseif command == "cancel" then ns.CancelArm()
+    elseif command == "mark" then ns.Mark(argument ~= "" and argument or nil)
+    elseif command == "report" then local record = ns.Capture(); print(ns.Export(record, "text"))
+    elseif command == "startup" then
+        if ns.ToggleStartup then ns.ToggleStartup()end
+    elseif command == "reload" then
+        if not ns.StartMeasuredReload or not ns.StartMeasuredReload() then
+            print(L("Замер перезагрузки доступен после входа в игру, вне боя.", "Measured reload is available after logging in and outside combat."))
+        end
+    elseif command == "background" then
+        if argument == "on" or argument == "off" then ns.SetBackgroundEnabled(argument == "on")
+        else for _, record in ipairs(ns.History()) do if record.kind == "background" then print(ns.Export(record, "text")); break end end end
+    elseif command == "top" or command == "info" then
+        local rows = ns.Snapshot()
+        if argument == "memory" then ns.Memory(true); rows = ns.Snapshot() end
+        local key = argument == "memory" and "memory" or argument == "peak" and "peak" or argument == "spikes" and "five" or "average"
+        table.sort(rows, function(a, b) return (a[key] or -1) > (b[key] or -1) end)
+        for i, row in ipairs(rows) do
+            if command == "top" and i <= 8 or command == "info" and row.name:lower():find(argument:lower(), 1, true) then
+                print(row.name .. "  " .. tostring(row[key] or "?") .. (key == "memory" and " MiB" or key == "five" and "" or " ms"))
+            end
+        end
+    else print("/sperf, /sperf watch 30, /sperf stop, /sperf report, /sperf startup, /sperf reload, /sperf background [on|off], /sperf top [recent|peak|spikes|memory], /sperf info AddonFolder") end
 end

@@ -4,10 +4,17 @@
 ## Notes-ruRU: Нагрузка аддонов, ручные замеры и фоновый сбор спайков.
 ## Author: Sintezza
 ## X-License: MIT
-## Version: 0.6.4
+## Version: 0.7.0
 ## IconTexture: Interface\AddOns\Sintezza_Perf\Media\Icon
 ## OptionalDeps: Sintezza_Theme
 ## SavedVariables: Sintezza_PerfDB
 
+Startup.lua
+History.lua
+Analytics.lua
 Perf.lua
+DeveloperHistory.lua
+Developer.lua
 Window.lua
+Phase2Window.lua
+DeveloperWindow.lua
